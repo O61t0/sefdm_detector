@@ -1,0 +1,185 @@
+% SEFDM Generate 
+
+clear;
+close all;
+path(path, './functions/');
+path(path, '../f_init_model/functions/');
+
+%
+% initialize params
+alpha = 15/16;
+IFFT_size = 16 ; 
+right_GI_len = 2;
+left_GI_len = 1;
+EbNo = 0 : 0.5 : 15; % snr
+N_iter = 1e3; % Iteration Times
+W = 48; % Number of symbols processed per iteration
+
+Nbps = 2; % QPSk 
+itera_d = 10;%detector itera times
+
+
+N = IFFT_size ; % Useful SEFDM subcarriers
+N_inf = N - right_GI_len - left_GI_len - 1; % modulation_symbol
+detectors = struct('name', {}, 'function', {});
+
+% 添加不同的检测器
+detectors(1).name = 'ZF';
+detectors(1).function = @ZF;
+detectors(2).name = 'MMSE';
+detectors(2).function = @MMSE;
+detectors(3).name = 'TSVD';
+detectors(3).function = @TSVD;
+detectors(4).name = 'IC';
+detectors(4).function = @IC;
+detectors(5).name = 'ID';
+detectors(5).function = @ID;
+
+
+
+%%
+% Initialize global params
+sefdm_init(IFFT_size, alpha, right_GI_len, left_GI_len, Nbps,itera_d)
+
+% Generate random bits
+tx_bit = randi([0 1], Nbps * N_inf * W, 1);
+tx_bit = reshape(tx_bit, Nbps * N_inf, W);
+
+% Modulation (equals to qammod)
+tx_modulation_sym = ConstellationMap(tx_bit, Nbps);
+
+% Tx and IFFT and add cp (to time domain)
+tx_sefdm_sym = sefdm_IFFT(sefdm_allocate_subcarriers(tx_modulation_sym, 'tx'),alpha);
+% 生成谱图
+tx_sefdm_stream = reshape(tx_sefdm_sym, 1, []);
+signal_length = length(tx_sefdm_stream);
+
+% 根据信号长度调整窗口长度
+win_len = min(500, signal_length);  % 窗口长度不能超过信号长度
+noverlap = floor(win_len / 2);      % 重叠长度设置为窗口长度的一半
+
+% 使用调整后的窗口长度进行频谱分析
+% [p_sefdm, f] = pwelch(tx_sefdm_stream, 500, 300, 500, 10e6);
+% figure;
+% plot(f, 10*log10(p_sefdm));
+% xlabel('Frequency (Hz)');
+% ylabel('Magnitude (dB)');
+% grid on;
+% clear tx_sefdm_stream p_sefdm f
+% spectrogram generation
+% % 生成三维频谱图
+% tx_sefdm_stream = reshape(tx_sefdm_sym, N, W); % 这里将符号矩阵转换为 N x W 的矩阵
+% 
+% % 初始化psd矩阵
+% psd_matrix = [];
+% 
+% % 为每个符号计算频谱
+% for i = 1:W
+%     % 动态计算窗口长度，确保不会超过信号长度
+%     win_len = min(500, N); 
+%     noverlap = floor(win_len / 2);
+% 
+%     [psd, f] = pwelch(tx_sefdm_stream(:, i), win_len, noverlap, 500, 10e6, 'centered');
+% 
+%     % 将计算得到的每个符号的频谱数据存储到psd_matrix矩阵中
+%     psd_matrix = [psd_matrix, psd];
+% end
+% 
+% % 创建时间向量
+% t = 1:W; 
+% 
+% % 绘制3D频谱图
+% figure;
+% surf(t, f, 10*log10(psd_matrix))
+% shading interp;
+% xlabel('Symbol Index');
+% ylabel('Frequency (Hz)');
+% zlabel('Magnitude (dB)');
+% title(sprintf('3D Spectrogram in alpha = %.2f', alpha));
+% colorbar;
+% view([45 45]);
+% 
+% grid on;
+% 
+% clear tx_sefdm_stream psd_matrix f
+
+%  AWGN, SEFDM Rx, Demodulation, Detection
+N_err_bit = zeros(1, length(EbNo));
+Eb = sum(sum(abs(tx_sefdm_sym) .^ 2)) / (Nbps * N_inf * W);
+
+BER_results = zeros(length(EbNo), length(detectors));
+
+% 遍历每个检测器
+for d = 1:length(detectors)
+    detector = detectors(d).function;
+    detector_name = detectors(d).name;
+    N_err_bit = zeros(1, length(EbNo));
+    
+    for i = 1 : length(EbNo)
+        
+        No = Eb / (10^(EbNo(i) / 10));
+        
+        for j = 1 : N_iter
+            % AWGN
+            noise = sqrt(No / 2) * (randn(N * W, 1) + 1i * randn(N * W, 1));
+            noise = reshape(noise, N, W);
+            rx_sefdm_sym = tx_sefdm_sym + noise;
+
+            % SEFDM Rx
+            R = sefdm_FFT(rx_sefdm_sym,alpha);
+            
+            % 使用选择的检测器进行信号检测
+            if detector_name == "MMSE"
+                rx_modulation_sym = detector(R,No,N);
+           
+            else
+                rx_modulation_sym = detector(R);
+            end
+
+            % 提取信息子载波，考虑保护间隔
+            rx_modulation_sym = sefdm_allocate_subcarriers(rx_modulation_sym, 'rx');
+
+            % 解调
+            rx_bit = ConstellationDemap(rx_modulation_sym, Nbps);
+
+            % 累积错误
+            N_err_bit(i) = N_err_bit(i) + biterr(tx_bit, rx_bit);
+        end
+    end
+    
+    % 计算BER
+    BER_results(:, d) = N_err_bit / (Nbps * N_inf * W * N_iter);
+end
+
+BER_ofdm = berawgn(EbNo, 'psk', 2, 'nondiff');
+
+% 绘制BER曲线
+figure;
+graph = semilogy(EbNo, BER_ofdm,EbNo,BER_results(:, 1),EbNo,BER_results(:,2),EbNo,BER_results(:,3),EbNo,BER_results(:,4),EbNo,BER_results(:,5));
+graph(1).Marker = '*';
+graph(2).Marker = '^';
+graph(3).Marker = 'o';
+graph(4).Marker = 'd';
+graph(5).Marker = 's';
+graph(6).Marker = 'x';
+graph(1).Color = 'k';
+graph(2).Color = 'c';
+graph(3).Color = 'r';
+graph(4).Color = 'm';
+graph(5).Color = 'b';
+
+xlabel('Eb/No (dB)');
+ylabel('BER');
+legend show;
+ylim([1e-3, 1]);
+% Initialize the legend names array with 'ofdm'
+legendNames = {'ofdm'};
+% Add the names of detectors from the structure
+for i = 1:length(detectors)
+    legendNames{end+1} = detectors(i).name;
+end
+% Now pass the legendNames array to the legend function
+legend(legendNames{:});
+grid on;
+title(sprintf('BER vs Eb/No for detector in Alpha = %.2f', alpha));
+
